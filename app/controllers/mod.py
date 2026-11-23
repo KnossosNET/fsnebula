@@ -124,7 +124,7 @@ def create_or_update_mod():
     if not user:
         abort(403)
 
-    meta = requests.get_json()
+    meta = request.get_json()
 
     if not meta:
         abort(400)
