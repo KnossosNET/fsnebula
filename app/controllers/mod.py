@@ -322,6 +322,39 @@ def announce_release(release, mod):
         app.logger.exception('Failed to execute Discord webhook!')
 
 
+def _release_file_checksums(release):
+    yield release.get('banner')
+    yield from release.get('screenshots', [])
+    yield from release.get('attachments', [])
+    for package in release.get('packages', []):
+        for archive in package.get('files', []):
+            if not archive.get('urls'):
+                yield archive.get('checksum')
+
+
+def _first_release_archives(files):
+    unowned = {file.checksum for file in files if not file.to_mongo().get('mod')}
+    permanent = [file.checksum for file in files if file.expires == -1 and file.checksum in unowned]
+    if not permanent:
+        return unowned
+
+    # Older releases may already use a permanent archive without having saved its owner.
+    matches = {'$in': permanent}
+    archive = {'$elemMatch': {'checksum': matches, 'urls.0': {'$exists': False}}}
+    references = [{'packages.files': archive}, {'banner': matches},
+                  {'screenshots': matches}, {'attachments': matches}]
+    fields = ['banner', 'screenshots', 'attachments', 'packages.files.checksum', 'packages.files.urls']
+    for release in ModRelease._get_collection().find({'$or': references}, fields):
+        unowned.difference_update(_release_file_checksums(release))
+    old_mod_refs = [{'releases.' + field: value} for ref in references for field, value in ref.items()]
+    query = {'$or': [{'logo': matches}, {'tile': matches}] + old_mod_refs}
+    for mod in Mod._get_collection().find(query, ['logo', 'tile'] + ['releases.' + field for field in fields]):
+        unowned.difference_update((mod.get('logo'), mod.get('tile')))
+        for release in mod.get('releases', []):
+            unowned.difference_update(_release_file_checksums(release))
+    return unowned
+
+
 @app.route('/api/1/mod/release', methods={'POST'})
 def create_release():
     meta, mod, release, user, error = _do_preflight(save=True)
@@ -404,6 +437,7 @@ def create_release():
             # All chunks have arrived
             release.hidden = False
 
+    first_release = _first_release_archives(files)
     try:
         release.save()
     except ValidationError as exc:
@@ -411,10 +445,10 @@ def create_release():
         return jsonify(result=False, reason=str(exc))
 
     for file in files:
-        if not file.mod:
-            file.mod = mod
-
         file.make_permanent()
+        if file.checksum in first_release:
+            UploadedFile._get_collection().update_one(
+                {'_id': file.pk, 'mod': None}, {'$set': {'mod': mod.pk}})
 
     if not release.hidden:
         if release.private:

@@ -9,6 +9,7 @@ master = true
 socket = 0.0.0.0:7701
 chown-socket = nginx
 processes = 12
+enable-threads = true
 
 uid = nebula
 gid = nebula

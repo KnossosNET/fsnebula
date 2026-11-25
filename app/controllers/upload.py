@@ -4,19 +4,23 @@ import re
 import shutil
 import stat
 import tempfile
-from contextlib import contextmanager, suppress
-from fcntl import flock, LOCK_EX, LOCK_NB
+import threading
+from contextlib import suppress
 import magic
 from io import SEEK_END
-from flask import request, jsonify, abort
+from flask import request, jsonify, abort, g, make_response
+from mongoengine.errors import DoesNotExist
 
 from .. import app
+from ..filelock import storage_lock as _storage_lock
 from ..helpers import verify_token, gen_hash
-from ..models import UploadedFile, ChunkedUpload
+from ..models import UploadedFile, ChunkedUpload, TEAM_UPLOADER
 
 
 HEX_RE = re.compile(r'[0-9a-f]{1,128}')
 SHA256_RE = re.compile(r'[0-9a-f]{64}')
+SYNC_VERIFY_BYTES = 4 * 1024 * 1024
+_verification_slot = threading.Lock()
 
 
 def _upload_id():
@@ -26,24 +30,10 @@ def _upload_id():
     return upload_id
 
 
-@contextmanager
-def _storage_lock(path, wait):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Keep the lock file so concurrent workers always lock the same inode.
-    # Closing the descriptor (including on worker exit) releases the lock.
-    with open(path, 'a+b') as lock:
-        try:
-            flock(lock, LOCK_EX if wait else LOCK_EX | LOCK_NB)
-        except BlockingIOError:
-            yield None
-        else:
-            yield lock
-
-
-def _upload_lock(upload_id, wait=True):
+def _upload_lock(upload_id, wait=True, shared=False):
     # The upload ID may differ from the checksum. Always lock the session first.
     path = os.path.join(app.config['FILE_STORAGE'], 'upload-locks', 'sessions', upload_id)
-    return _storage_lock(path, wait)
+    return _storage_lock(path, wait, shared)
 
 
 def _checksum_lock_path(checksum):
@@ -75,7 +65,6 @@ def _read_lock_value(lock):
 
 
 def _write_lock_value(lock, value):
-    # Keep the cache on disk so old MongoEngine models can still read every record.
     lock.seek(0)
     lock.truncate()
     lock.write(value.encode('ascii'))
@@ -105,11 +94,55 @@ def _verified_file(path, size, checksum, verified=None):
     return None
 
 
+def _cache_checksum(path, info, checksum, lock):
+    fingerprint = _fingerprint(info)
+    cached = _read_lock_value(lock)
+    if cached == fingerprint:
+        return True
+    if cached == '-' + fingerprint:
+        return False
+    verified = _verified_file(path, info.st_size, checksum)
+    if verified:
+        _write_lock_value(lock, verified)
+        return True
+    with suppress(FileNotFoundError):
+        if _fingerprint(os.stat(path)) == fingerprint:
+            _write_lock_value(lock, '-' + fingerprint)
+    return False
+
+
+def _verify_in_background(path, checksum):
+    try:
+        with _checksum_lock(checksum) as lock:
+            info = os.stat(path)
+            if stat.S_ISREG(info.st_mode):
+                _cache_checksum(path, info, checksum, lock)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        app.logger.exception('Failed to verify stored file %s', checksum)
+    finally:
+        _verification_slot.release()
+
+
+def _verification_pending():
+    abort(make_response(jsonify(result=False, reason='archive verification pending'), 503, {'Retry-After': '2'}))
+
+
+def _stored_file_info(path):
+    try:
+        info = os.stat(path)
+        if stat.S_ISREG(info.st_mode):
+            return info
+    except FileNotFoundError:
+        pass
+
+
 def _published_record(checksum, size, lock, metadata=None):
     record = UploadedFile.objects(checksum=checksum).first()
-    if record and record.expires == -1 and record.storage == 'cold':
-        # A cold object is served by its configured remote mirror.
-        return record if record.filesize == size else None
+    if record and record.storage == 'cold':
+        # The mirror is authoritative, including when the legacy size is unknown.
+        return record
 
     needs_save = record is None or record.expires != -1 or record.filesize != size
     if record is None:
@@ -136,6 +169,23 @@ def _published_record(checksum, size, lock, metadata=None):
     return record
 
 
+def _require_repair_permission(record, user):
+    if record is None or record.expires != -1:
+        return
+    try:
+        mod = record.mod
+    except DoesNotExist:
+        abort(403)
+    if mod is None:
+        # Multipart files can be permanent before their first release. Repair
+        # a truncated file, but preserve a takedown when ownership is unknown.
+        if os.path.isfile(os.path.join(app.config['FILE_STORAGE'], record.filename)):
+            return
+    elif any(member.role <= TEAM_UPLOADER and member.to_mongo().get('user') == user.pk for member in mod.team):
+        return
+    abort(403)
+
+
 def _set_upload_done(upload):
     if not upload.done:
         upload.done = True
@@ -157,17 +207,43 @@ def _reset_lost_upload(upload):
         upload.save()
 
 
-def checked_upload_record(record):
-    if not record or not SHA256_RE.fullmatch(record.checksum):
+def checked_upload_record(record, warm=False):
+    if not record or record.storage in ('cold', 'external-image') or not SHA256_RE.fullmatch(record.checksum):
         return record
     checksum = record.checksum
-    upload = ChunkedUpload.objects(id=checksum).first()
-    if upload or os.path.isfile(_checksum_lock_path(checksum)):
-        with _checksum_lock(checksum) as lock:
-            if upload or _read_lock_value(lock):
-                size = upload.filesize if upload else record.filesize
-                return _published_record(checksum, size, lock)
-    return record
+    path = os.path.join(app.config['FILE_STORAGE'], record.filename)
+    tracked = ChunkedUpload.objects(id=checksum).only('id').first() is not None
+    if not tracked and not os.path.isfile(_checksum_lock_path(checksum)):
+        return record if _stored_file_info(path) else None
+    with _checksum_lock(checksum, wait=warm) as lock:
+        if lock is None:
+            _verification_pending()
+        info = _stored_file_info(path)
+        if not info:
+            return None
+        cached = _read_lock_value(lock)
+        if not cached and not tracked:
+            return record
+        if record.filesize is not None and record.filesize != info.st_size:
+            return None
+        fingerprint = _fingerprint(info)
+        if cached == fingerprint:
+            return record
+        if cached == '-' + fingerprint:
+            return None
+        if not warm:
+            budget = getattr(g, 'upload_verify_bytes', SYNC_VERIFY_BYTES)
+            if info.st_size > budget:
+                if _verification_slot.acquire(False):
+                    worker = threading.Thread(target=_verify_in_background, args=(path, checksum), daemon=True)
+                    try:
+                        worker.start()
+                    except RuntimeError:
+                        _verification_slot.release()
+                        app.logger.exception('Could not start verification for %s', checksum)
+                _verification_pending()
+            g.upload_verify_bytes = budget - info.st_size
+        return record if _cache_checksum(path, info, checksum, lock) else None
 
 
 @app.route('/api/1/upload/check', methods={'POST'})
@@ -251,14 +327,17 @@ def upload_file():
     record.validate()
     with _checksum_lock(checksum) as lock:
         existing = UploadedFile.objects(checksum=checksum).first()
+        if existing and existing.storage == 'cold':
+            return jsonify(result=True)
         if existing and existing.expires == -1:
-            if existing.storage == 'cold':
-                return jsonify(result=True)
             record = existing
             record.filesize = file.tell()
 
         full_path = os.path.join(app.config['FILE_STORAGE'], record.filename)
-        if _verified_file(full_path, record.filesize, checksum, _read_lock_value(lock)) is None:
+        cached = _read_lock_value(lock)
+        verified = _verified_file(full_path, record.filesize, checksum, cached)
+        if verified is None:
+            _require_repair_permission(record, user)
             temp_dir = os.path.join(app.config['FILE_STORAGE'], 'temp')
             os.makedirs(temp_dir, exist_ok=True)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -266,7 +345,18 @@ def upload_file():
                 source = os.path.join(work_dir, 'file')
                 file.seek(0)
                 file.save(source)
+                if not _verified_file(source, record.filesize, checksum):
+                    return jsonify(result=False, reason='checksum')
+                if record.expires == -1:
+                    current = UploadedFile.objects.get(checksum=checksum)
+                    if current.storage == 'cold':
+                        return jsonify(result=True)
+                    _require_repair_permission(current, user)
                 os.replace(source, full_path)
+                with suppress(FileNotFoundError):
+                    verified = _fingerprint(os.stat(full_path))
+        if verified and verified != cached:
+            _write_lock_value(lock, verified)
         if record.expires == -1:
             record.save()
         elif not record.save_unless_permanent():
@@ -291,24 +381,24 @@ def start_chunked_upload():
 
     with _upload_lock(upload_id, wait=False) as lock:
         if lock:
-            return _start_upload(upload_id, size, parts, lock)
+            return _start_upload(upload_id, size, parts, lock, user)
         upload = ChunkedUpload.objects(id=upload_id).first()
         if upload:
             return jsonify(result=True, done=False, finished_parts=upload.finished_parts)
 
     # Two first-time start requests may arrive before either has registered the upload.
     with _upload_lock(upload_id) as lock:
-        return _start_upload(upload_id, size, parts, lock)
+        return _start_upload(upload_id, size, parts, lock, user)
 
 
-def _start_upload(upload_id, size, parts, session_lock):
+def _start_upload(upload_id, size, parts, session_lock, user):
     upload = ChunkedUpload.objects(id=upload_id).first()
-    if upload is None:
+    new_upload = upload is None
+    if new_upload:
         # The database record may have expired while its lock file remained.
         _write_lock_value(session_lock, '')
         upload = ChunkedUpload(id=upload_id, filesize=size, total_parts=parts,
                                expires=time.time() + 24 * 60 * 60)
-        upload.save()
     if upload.filesize != size:
         return jsonify(result=False, done=False, reason='upload size mismatch')
 
@@ -317,13 +407,18 @@ def _start_upload(upload_id, size, parts, session_lock):
     if SHA256_RE.fullmatch(checksum):
         with _checksum_lock(checksum, wait=False) as lock:
             if not lock:
+                if new_upload:
+                    upload.save()
                 return jsonify(result=True, done=False, finished_parts=upload.finished_parts)
             if _published_record(checksum, size, lock):
                 if not saved_checksum:
                     _write_lock_value(session_lock, checksum)
                 _set_upload_done(upload)
                 return jsonify(result=True, done=True, finished_parts=upload.finished_parts)
+            _require_repair_permission(UploadedFile.objects(checksum=checksum).first(), user)
 
+    if new_upload:
+        upload.save()
     _reset_lost_upload(upload)
     if upload.total_parts != parts:
         return jsonify(result=False, done=False, reason='upload part count mismatch')
@@ -353,13 +448,13 @@ def finish_chunked_upload():
             upload = _get_upload(upload_id)
             with _checksum_lock(checksum, wait=False) as lock:
                 if lock:
-                    return _finish_upload(upload, checksum, session_lock, lock)
+                    return _finish_upload(upload, checksum, session_lock, lock, user)
 
     # Knossos 1.3 treats this as a missing finish reply and polls start.
-    return jsonify(result=False, reason='upload busy'), 503, {'Retry-After': '2'}
+    return _upload_busy()
 
 
-def _finish_upload(upload, checksum, session_lock, lock):
+def _finish_upload(upload, checksum, session_lock, lock, user):
     saved_checksum = _saved_checksum(session_lock)
     if saved_checksum and saved_checksum != checksum:
         return jsonify(result=False, reason='checksum fail')
@@ -367,8 +462,10 @@ def _finish_upload(upload, checksum, session_lock, lock):
     # Unbound legacy IDs must still prove the bytes in their own chunks.
     can_resume = checksum == upload.id or saved_checksum is not None or upload.done
     if not can_resume or _published_record(checksum, upload.filesize, lock, request.form) is None:
+        if upload.done:
+            _require_repair_permission(UploadedFile.objects(checksum=checksum).first(), user)
         _reset_lost_upload(upload)
-        error = _assemble_upload(upload, checksum, request.form, lock, check_published=not can_resume)
+        error = _assemble_upload(upload, checksum, request.form, lock, user, check_published=not can_resume)
         if error:
             return jsonify(result=False, reason=error)
 
@@ -379,7 +476,7 @@ def _finish_upload(upload, checksum, session_lock, lock):
     return jsonify(result=True)
 
 
-def _assemble_upload(upload, checksum, metadata, lock, check_published):
+def _assemble_upload(upload, checksum, metadata, lock, user, check_published):
     chunk_dir = _chunk_dir(upload.id)
     os.makedirs(chunk_dir, exist_ok=True)
     # Remove temporary files left behind if the previous worker died.
@@ -392,18 +489,6 @@ def _assemble_upload(upload, checksum, metadata, lock, check_published):
             with suppress(OSError):
                 if os.path.getmtime(path) < cutoff:
                     os.unlink(path)
-
-    record = UploadedFile.objects(checksum=checksum).first()
-    if record is None:
-        record = UploadedFile(checksum=checksum)
-    if record.expires != -1:
-        record.expires = -1
-        record.gen_filename()
-    record.filesize = upload.filesize
-    record.content_checksum = metadata.get('content_checksum') or record.content_checksum
-    record.vp_checksum = metadata.get('vp_checksum') or record.vp_checksum
-    record.storage = None
-    record.validate()
 
     with tempfile.TemporaryDirectory(prefix='assembly-', dir=chunk_dir) as work_dir:
         source = os.path.join(work_dir, 'file')
@@ -424,7 +509,19 @@ def _assemble_upload(upload, checksum, metadata, lock, check_published):
         if check_published and _published_record(checksum, upload.filesize, lock):
             return None
 
-        # Publish only closed, verified bytes, in one rename on FILE_STORAGE.
+        record = UploadedFile.objects(checksum=checksum).first()
+        if record and record.storage == 'cold':
+            return None
+        _require_repair_permission(record, user)
+        if record is None:
+            record = UploadedFile(checksum=checksum)
+        if record.expires != -1:
+            record.content_checksum = metadata.get('content_checksum') or record.content_checksum
+            record.vp_checksum = metadata.get('vp_checksum') or record.vp_checksum
+            record.expires = -1
+            record.gen_filename()
+        record.filesize = upload.filesize
+        record.validate()
         dest = os.path.join(app.config['FILE_STORAGE'], record.filename)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         os.replace(source, dest)
@@ -440,15 +537,21 @@ def upload_chunk():
 
     upload_id = _upload_id()
     part = request.files['file']
-    with _upload_lock(upload_id):
+    with _upload_lock(upload_id, wait=False, shared=True) as lock:
+        if not lock:
+            return _upload_busy()
         upload = _get_upload(upload_id)
         idx = _part_index(upload)
-        if not upload.done:
-            chunk_dir = _chunk_dir(upload_id)
-            os.makedirs(chunk_dir, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix='part-', dir=chunk_dir) as work_dir:
-                source = os.path.join(work_dir, 'part')
-                part.save(source)
+        if upload.done:
+            return 'OK'
+        chunk_dir = _chunk_dir(upload_id)
+        os.makedirs(chunk_dir, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='part-', dir=chunk_dir) as work_dir:
+            source = os.path.join(work_dir, 'part')
+            part.save(source)
+            with _part_lock(chunk_dir, idx) as part_lock:
+                if not part_lock:
+                    return _upload_busy()
                 upload.update(pull__finished_parts=idx)
                 os.replace(source, os.path.join(chunk_dir, str(idx)))
     return 'OK'
@@ -460,20 +563,33 @@ def verify_chunk():
         abort(403)
 
     upload_id = _upload_id()
-    with _upload_lock(upload_id):
+    with _upload_lock(upload_id, wait=False, shared=True) as lock:
+        if not lock:
+            return _upload_busy()
         upload = _get_upload(upload_id)
         idx = _part_index(upload)
         if upload.done:
             return jsonify(result=True)
-        chunk_path = os.path.join(_chunk_dir(upload_id), str(idx))
-        try:
-            with open(chunk_path, 'rb') as chunk:
-                if gen_hash(chunk, 'sha256', read_size=1024 * 1024) != request.form['checksum']:
-                    return jsonify(result=False, reason='checksum')
-        except FileNotFoundError:
-            return jsonify(result=False, reason='part missing')
-        upload.update(add_to_set__finished_parts=idx)
+        chunk_dir = _chunk_dir(upload_id)
+        with _part_lock(chunk_dir, idx) as part_lock:
+            if not part_lock:
+                return _upload_busy()
+            try:
+                with open(os.path.join(chunk_dir, str(idx)), 'rb') as chunk:
+                    if gen_hash(chunk, 'sha256', read_size=1024 * 1024) != request.form['checksum']:
+                        return jsonify(result=False, reason='checksum')
+            except FileNotFoundError:
+                return jsonify(result=False, reason='part missing')
+            upload.update(add_to_set__finished_parts=idx)
     return jsonify(result=True)
+
+
+def _part_lock(chunk_dir, idx):
+    return _storage_lock(os.path.join(chunk_dir, 'locks', str(idx)), wait=False)
+
+
+def _upload_busy():
+    return jsonify(result=False, reason='upload busy'), 503, {'Retry-After': '2'}
 
 
 def _part_index(upload):
